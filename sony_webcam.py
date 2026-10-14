@@ -18,6 +18,9 @@ TARGET_FPS = 30
 
 # Frame synchronization queue (maxsize=1 guarantees zero buffer buildup & 1-to-1 frame sync)
 frame_queue = queue.Queue(maxsize=1)
+
+# Cap OpenCV's thread pool; the frames are tiny, so extra threads only burn CPU.
+cv2.setNumThreads(2)
 running = True
 
 def enable_continuous_autofocus():
@@ -37,15 +40,39 @@ def enable_continuous_autofocus():
     except Exception as e:
         print(f">>> Note: Focus mode setup response: {e}")
 
+def camera_call(method, params=None):
+    payload = json.dumps({"method": method, "params": params or [], "id": 1, "version": "1.0"}).encode("utf-8")
+    req = urllib.request.Request(CAMERA_API_URL, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        return json.loads(resp.read().decode())
+
+def get_stream_url():
+    """Asks the camera for the largest live view it offers; falls back to the fixed URL."""
+    try:
+        apis = camera_call("getAvailableApiList").get("result", [[]])[0]
+        print(f">>> Camera live view APIs: {[a for a in apis if 'iveview' in a]}")
+        if "startLiveviewWithSize" in apis:
+            res = camera_call("startLiveviewWithSize", ["L"])
+            if "result" in res:
+                return res["result"][0]
+        if "startLiveview" in apis:
+            res = camera_call("startLiveview")
+            if "result" in res:
+                return res["result"][0]
+    except Exception as e:
+        print(f">>> Note: live view negotiation failed ({e}); using default URL")
+    return STREAM_URL
+
 def camera_reader_thread():
     """Dedicated high-speed thread to ingest frames directly from camera TCP stream."""
     global running
-    
+
     enable_continuous_autofocus()
-    
+    stream_url = get_stream_url()
+
     while running:
         try:
-            req = urllib.request.Request(STREAM_URL)
+            req = urllib.request.Request(stream_url)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 print(">>> Connected to Sony RX100 M2 live stream!")
                 
@@ -89,6 +116,37 @@ def camera_reader_thread():
             if running:
                 time.sleep(1)
 
+def open_virtual_camera():
+    """Prefers the bundled Unity Capture driver; falls back to any other installed driver (e.g. OBS)."""
+    kwargs = dict(width=TARGET_WIDTH, height=TARGET_HEIGHT, fps=TARGET_FPS, fmt=pyvirtualcam.PixelFormat.BGR)
+    try:
+        return pyvirtualcam.Camera(backend="unitycapture", **kwargs)
+    except Exception:
+        pass
+    try:
+        return pyvirtualcam.Camera(**kwargs)
+    except Exception as e:
+        print(f"\nNo virtual camera driver found ({e}).")
+        print("Run Install_Driver.bat once (it will ask for administrator permission), then start again.")
+        input("Press Enter to exit...")
+        sys.exit(1)
+
+def load_upscaler():
+    """Loads a tiny CPU super-resolution model (opt-in via --ai); None if unavailable."""
+    import os
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(base, "ESPCN_x2.pb")
+    try:
+        sr = cv2.dnn_superres.DnnSuperResImpl_create()
+        sr.readModel(path)
+        sr.setModel("espcn", 2)
+        print(">>> AI upscaler (ESPCN x2, CPU) enabled")
+        return sr
+    except Exception as e:
+        print(f">>> AI upscaler unavailable ({e}); using sharpen + resize. "
+              "Needs opencv-contrib-python and ESPCN_x2.pb next to this script.")
+        return None
+
 def main():
     global running
     
@@ -96,47 +154,77 @@ def main():
     print("  Sony RX100 M2 Tear-Free Ultra-Low Latency Webcam Bridge")
     print("=" * 65)
     print("Sync Mode: Event-driven hardware shutter sync (Zero clock drift)")
-    print("Target Device: 'OBS Virtual Camera' (1280x720 @ 30 FPS)")
+    print("Output: virtual webcam, 1280x720 (Unity Capture, or OBS Virtual Camera as fallback)")
     print("Press Ctrl+C anytime to stop.\n")
 
     t = threading.Thread(target=camera_reader_thread, daemon=True)
     t.start()
 
-    print("Synchronizing with camera shutter clock...")
-    first_frame = frame_queue.get()
-    print(">>> First frame locked! Opening Virtual Camera device...")
+    print("Waiting for first camera frame...")
+    while True:
+        try:
+            frame_queue.get(timeout=0.5)
+            break
+        except queue.Empty:
+            continue
+    print(">>> First frame received! Opening Virtual Camera device...")
 
-    with pyvirtualcam.Camera(width=TARGET_WIDTH, height=TARGET_HEIGHT, fps=TARGET_FPS, fmt=pyvirtualcam.PixelFormat.RGB) as cam:
+    # BGR is OpenCV's native order, so no per-frame color conversion is needed.
+    with open_virtual_camera() as cam:
         print(f">>> Virtual Camera Active: '{cam.device}'")
-        print(">>> Tear-free hardware synchronized streaming running!\n")
-        
-        frame_count = 0
-        start_time = time.time()
-        
-        while running:
-            # Block until the camera delivers the EXACT next frame
-            try:
-                frame = frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+        print(">>> Streaming at a fixed, paced frame rate.\n")
 
-            # 1. Subtle spatial unsharp mask (enhances fine facial details, hair, text)
-            gaussian = cv2.GaussianBlur(frame, (0, 0), 1.2)
-            sharpened = cv2.addWeighted(frame, 1.35, gaussian, -0.35, 0)
-            
-            # 2. Smooth, fast interpolation to standard 720p 16:9
-            upscaled = cv2.resize(sharpened, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_LINEAR)
-            
-            # 3. Fast color conversion BGR -> RGB
-            rgb_frame = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
-            
-            # 4. Push directly to Virtual Camera
-            cam.send(rgb_frame)
-            
-            frame_count += 1
-            if frame_count % 90 == 0:
-                fps = frame_count / (time.time() - start_time)
-                print(f"\rStreaming live: {frame_count} frames synchronized (~{fps:.1f} FPS)", end="", flush=True)
+        # Preallocated buffers: no per-frame allocations, so RAM stays flat.
+        blurred = None
+        sr = load_upscaler() if "--ai" in sys.argv else None
+        out = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), np.uint8)
+
+        sent = 0
+        fresh = 0
+        start_time = time.time()
+
+        while running:
+            # Send each camera frame the moment it arrives (no waiting for a frame
+            # slot, so it can exceed TARGET_FPS). If the camera stalls, re-send the
+            # last frame so the virtual camera never goes dark.
+            try:
+                frame = frame_queue.get(timeout=1.0 / TARGET_FPS)
+            except queue.Empty:
+                frame = None
+
+            if frame is not None:
+                # Center-crop to 16:9 with a zero-copy slice (no extra processing step).
+                h, w = frame.shape[:2]
+                crop_h = w * 9 // 16
+                if crop_h < h:
+                    y0 = (h - crop_h) // 2
+                    frame = frame[y0:y0 + crop_h]
+                frame = np.ascontiguousarray(frame)
+                if sr is not None and frame.shape[1] * 2 == TARGET_WIDTH:
+                    # Tiny CPU neural 2x upscaler (replaces sharpen + resize).
+                    up = sr.upsample(frame)
+                    if up.shape[:2] == (TARGET_HEIGHT, TARGET_WIDTH):
+                        out = up
+                    else:
+                        cv2.resize(up, (TARGET_WIDTH, TARGET_HEIGHT), dst=out, interpolation=cv2.INTER_LINEAR)
+                else:
+                    if blurred is None or blurred.shape != frame.shape:
+                        blurred = np.empty_like(frame)
+                    # Unsharp mask at the camera's native (small) resolution, in place.
+                    cv2.GaussianBlur(frame, (0, 0), 1.2, dst=blurred)
+                    cv2.addWeighted(frame, 1.35, blurred, -0.35, 0, dst=frame)
+                    cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), dst=out, interpolation=cv2.INTER_LINEAR)
+                fresh += 1
+            elif sent:
+                # Camera stalled: pace the repeat frames without busy-waiting.
+                cam.sleep_until_next_frame()
+
+            cam.send(out)
+            sent += 1
+
+            if sent % 90 == 0:
+                elapsed = time.time() - start_time
+                print(f"\rOut: {sent / elapsed:.1f} FPS | camera: {fresh / elapsed:.1f} FPS", end="", flush=True)
 
 if __name__ == "__main__":
     try:
