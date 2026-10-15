@@ -47,7 +47,9 @@ def camera_call(method, params=None):
         return json.loads(resp.read().decode())
 
 def get_stream_url():
-    """Asks the camera for the largest live view it offers; falls back to the fixed URL."""
+    """Uses the fixed live view URL; with --hires, asks the camera for its largest size instead."""
+    if "--hires" not in sys.argv:
+        return STREAM_URL
     try:
         apis = camera_call("getAvailableApiList").get("result", [[]])[0]
         print(f">>> Camera live view APIs: {[a for a in apis if 'iveview' in a]}")
@@ -131,22 +133,6 @@ def open_virtual_camera():
         input("Press Enter to exit...")
         sys.exit(1)
 
-def load_upscaler():
-    """Loads a tiny CPU super-resolution model (opt-in via --ai); None if unavailable."""
-    import os
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(base, "ESPCN_x2.pb")
-    try:
-        sr = cv2.dnn_superres.DnnSuperResImpl_create()
-        sr.readModel(path)
-        sr.setModel("espcn", 2)
-        print(">>> AI upscaler (ESPCN x2, CPU) enabled")
-        return sr
-    except Exception as e:
-        print(f">>> AI upscaler unavailable ({e}); using sharpen + resize. "
-              "Needs opencv-contrib-python and ESPCN_x2.pb next to this script.")
-        return None
-
 def main():
     global running
     
@@ -176,11 +162,11 @@ def main():
 
         # Preallocated buffers: no per-frame allocations, so RAM stays flat.
         blurred = None
-        sr = load_upscaler() if "--ai" in sys.argv else None
         out = np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 3), np.uint8)
 
         sent = 0
         fresh = 0
+        proc_ms = 0.0
         start_time = time.time()
 
         while running:
@@ -193,6 +179,7 @@ def main():
                 frame = None
 
             if frame is not None:
+                t0 = time.perf_counter()
                 # Center-crop to 16:9 with a zero-copy slice (no extra processing step).
                 h, w = frame.shape[:2]
                 crop_h = w * 9 // 16
@@ -200,21 +187,14 @@ def main():
                     y0 = (h - crop_h) // 2
                     frame = frame[y0:y0 + crop_h]
                 frame = np.ascontiguousarray(frame)
-                if sr is not None and frame.shape[1] * 2 == TARGET_WIDTH:
-                    # Tiny CPU neural 2x upscaler (replaces sharpen + resize).
-                    up = sr.upsample(frame)
-                    if up.shape[:2] == (TARGET_HEIGHT, TARGET_WIDTH):
-                        out = up
-                    else:
-                        cv2.resize(up, (TARGET_WIDTH, TARGET_HEIGHT), dst=out, interpolation=cv2.INTER_LINEAR)
-                else:
-                    if blurred is None or blurred.shape != frame.shape:
-                        blurred = np.empty_like(frame)
-                    # Unsharp mask at the camera's native (small) resolution, in place.
-                    cv2.GaussianBlur(frame, (0, 0), 1.2, dst=blurred)
-                    cv2.addWeighted(frame, 1.35, blurred, -0.35, 0, dst=frame)
-                    cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), dst=out, interpolation=cv2.INTER_LINEAR)
+                if blurred is None or blurred.shape != frame.shape:
+                    blurred = np.empty_like(frame)
+                # Unsharp mask at the camera's native (small) resolution, in place.
+                cv2.GaussianBlur(frame, (0, 0), 1.2, dst=blurred)
+                cv2.addWeighted(frame, 1.35, blurred, -0.35, 0, dst=frame)
+                cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT), dst=out, interpolation=cv2.INTER_LINEAR)
                 fresh += 1
+                proc_ms += (time.perf_counter() - t0) * 1000
             elif sent:
                 # Camera stalled: pace the repeat frames without busy-waiting.
                 cam.sleep_until_next_frame()
@@ -224,7 +204,8 @@ def main():
 
             if sent % 90 == 0:
                 elapsed = time.time() - start_time
-                print(f"\rOut: {sent / elapsed:.1f} FPS | camera: {fresh / elapsed:.1f} FPS", end="", flush=True)
+                print(f"\rOut: {sent / elapsed:.1f} FPS | camera: {fresh / elapsed:.1f} FPS | "
+                      f"processing: {proc_ms / max(fresh, 1):.1f} ms/frame | {cam.device}   ", end="", flush=True)
 
 if __name__ == "__main__":
     try:
